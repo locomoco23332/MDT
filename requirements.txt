@@ -1,0 +1,21 @@
+# PPO MetaDrive Requirements
+# Core dependencies
+torch>=2.0.0
+numpy>=1.21.0
+gymnasium>=0.28.0
+matplotlib>=3.5.0
+
+# MetaDrive environment
+metadrive>=0.3.0
+
+# Optional dependencies for better performance
+# torch-audio  # Uncomment if using audio features
+# torch-vision  # Uncomment if using vision features
+
+# Development dependencies (optional)
+# jupyter>=1.0.0
+# ipykernel>=6.0.0
+# notebook>=6.4.0
+
+
+
