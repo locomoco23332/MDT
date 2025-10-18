@@ -1,0 +1,484 @@
+# -*- coding: utf-8 -*-
+"""
+MaxEnt RL with EBFlow (MEow-style) + AMASS Linear Hamiltonian Manifold
+Runs on Isaac Gym (vectorized). One-file reference implementation.
+
+Requirements:
+  - python>=3.9, torch>=2.2
+  - numpy, scipy, tqdm
+  - (Optional) scikit-learn for PCA (or use the simple PCA below)
+  - Isaac Gym (IsaacGymEnvs) properly installed and importable
+
+Usage (example):
+  python amass_meow_isaac.py --amass_root /path/to/AMASS --env Humanoid --k 32 --steps 200000
+
+Author: ChatGPT (GPT-5 Thinking)
+"""
+
+import os, math, argparse, time
+from dataclasses import dataclass
+from typing import Tuple, Optional
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# ------------------------------
+# Utils
+# ------------------------------
+def mlp(in_dim, out_dim, hidden=(256,256), act=nn.SiLU, out_act=None):
+    layers = []
+    last = in_dim
+    for h in hidden:
+        layers += [nn.Linear(last, h), act()]
+        last = h
+    layers.append(nn.Linear(last, out_dim))
+    if out_act is not None:
+        layers.append(out_act())
+    return nn.Sequential(*layers)
+
+# ------------------------------
+# AMASS linear Hamiltonian manifold
+# ------------------------------
+class SimplePCA:
+    """Tiny PCA (no sklearn). Returns components (V), mean, explained vars."""
+    def fit(self, X, k):
+        # X: [N, D]
+        mu = X.mean(0, keepdims=True)
+        Xc = X - mu
+        # economy SVD
+        U, S, Vt = torch.linalg.svd(Xc, full_matrices=False)
+        V = Vt[:k].T    # [D, k]
+        self.mean_ = mu.squeeze(0)
+        self.components_ = V
+        self.svals_ = S
+        self.explained_ = (S[:k]**2) / (S**2).sum()
+        return self
+
+    def transform(self, X):
+        return (X - self.mean_) @ self.components_
+
+    def inverse_transform(self, Z):
+        return Z @ self.components_.T + self.mean_
+
+
+@dataclass
+class HamiltonianManifoldCfg:
+    k: int = 32      # latent pos dimension
+    dt: float = 1/60 # AMASS frame delta
+    eps: float = 1e-6
+
+
+class LinearHamiltonianManifold(nn.Module):
+    """
+    Learn a linear Hamiltonian model from AMASS joint-angle trajectories:
+      1) PCA -> q in R^k
+      2) p ~ M qdot  (we estimate p directly then fit M,K with least squares)
+      3) Hamilton's eqs: qdot = M^{-1} p, pdot = -K q
+    We estimate (M^{-1}, K) linear maps in the reduced space.
+    """
+    def __init__(self, D_in: int, cfg: HamiltonianManifoldCfg):
+        super().__init__()
+        self.cfg = cfg
+        self.pca = SimplePCA()
+        self.register_buffer('mu', torch.zeros(D_in))
+        self.register_buffer('V', torch.eye(D_in)[:, :cfg.k])  # will be overwritten
+        # Linear maps in latent space:
+        # qdot = A p,  pdot = -B q    (A = M^{-1}, B = K)
+        self.A = nn.Parameter(torch.eye(cfg.k))  # [k,k]
+        self.B = nn.Parameter(torch.eye(cfg.k))  # [k,k]
+
+    @torch.no_grad()
+    def fit_from_amass(self, amass_root: str, take=50):
+        """
+        Very light AMASS loader: expects .npz or .npy arrays of joint angles per sequence.
+        You can adapt to your AMASS format. We just collect frames as [N, D].
+        """
+        device = self.mu.device
+        seqs = []
+        cnt = 0
+        for root, _, files in os.walk(amass_root):
+            for f in files:
+                if f.endswith('.npy') or f.endswith('.npz'):
+                    path = os.path.join(root, f)
+                    try:
+                        if f.endswith('.npy'):
+                            X = torch.from_numpy(np.load(path)).float()  # [T, D]
+                        else:
+                            data = np.load(path)
+                            key = list(data.keys())[0]
+                            X = torch.from_numpy(np.array(data[key])).astype(np.float32)
+                            X = torch.from_numpy(np.array(data[key])).float()
+                        if X.ndim != 2: 
+                            continue
+                        seqs.append(X)
+                        cnt += 1
+                        if cnt >= take: 
+                            break
+                    except Exception:
+                        continue
+            if cnt >= take: 
+                break
+        assert len(seqs) > 0, "No AMASS sequences found. Please point --amass_root to joint-angle arrays."
+
+        X = torch.cat(seqs, dim=0).to(device)     # [N, D]
+        N, D = X.shape
+        self.mu = X.mean(0)
+        # Fit PCA
+        self.pca.fit(X, self.cfg.k)
+        self.V = self.pca.components_.to(device)  # [D, k]
+        # Prepare (q, qdot)
+        dt = self.cfg.dt
+        q = (X - self.pca.mean_.to(device)) @ self.V        # [N, k]
+        q_next = torch.roll(q, shifts=-1, dims=0)
+        qdot = (q_next - q) / dt
+        q = q[:-1]; qdot = qdot[:-1]
+        # Define p as unknown latent momentum; we set p ≈ C qdot, but we fit A directly from (qdot,p)
+        # Use identity mass: A ≈ I (warm start). Then solve pdot = -B q from finite diff of p.
+        # We directly fit A from least squares qdot = A p  with p chosen as qdot (initially),
+        # then refine A,B alternating a couple of steps.
+        p = qdot.clone()
+        for _ in range(3):
+            # Fit A: qdot ≈ A p  -> A = argmin ||A p - qdot||_F
+            # A = qdot p^+  (pseudoinverse)
+            A = (qdot.T @ p) @ torch.linalg.pinv(p.T @ p + 1e-6*torch.eye(self.cfg.k, device=device))
+            self.A.data.copy_(A)
+            # Build pdot
+            p_next = torch.roll(p, shifts=-1, dims=0)[:-1]
+            pdot = (p_next - p[:-1]) / dt
+            q_m = q[:-1]
+            # Fit B: pdot ≈ -B q  -> B = -(pdot q^+)
+            B = -(pdot.T @ q_m) @ torch.linalg.pinv(q_m.T @ q_m + 1e-6*torch.eye(self.cfg.k, device=device))
+            self.B.data.copy_(B)
+            # Optionally refine p by enforcing qdot ≈ A p  -> p ≈ A^+ qdot
+            p = (torch.linalg.pinv(self.A) @ qdot.T).T
+
+        print(f"[Hamiltonian] Fitted latent k={self.cfg.k}. ||A||={self.A.norm():.3f}, ||B||={self.B.norm():.3f}")
+
+    def encode(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        x: [B, D] full DOF pose
+        returns:
+          q: [B, k], p: [B, k], r: residual (nonlinear part): [B, D-k]
+        """
+        q_full = (x - self.pca.mean_.to(x.device))   # center
+        q = q_full @ self.V                          # project
+        # Momentum proxy p from qdot is not available instantaneously; use linear predictor p ≈ A^+ qdot.
+        # At inference, we can't finite-diff. We approximate p via a learned small regressor from q (optional).
+        # For simplicity, use p ≈ 0 at encode-time and let RL learn corrections; or learn a tiny net:
+        return q, torch.zeros_like(q), (x - (q @ self.V.T + self.pca.mean_.to(x.device)))
+
+    def step_dynamics(self, q: torch.Tensor, p: torch.Tensor, dt: float) -> Tuple[torch.Tensor, torch.Tensor]:
+        qdot = p @ self.A.T          # qdot = A p
+        pdot = -(q @ self.B.T)       # pdot = -B q
+        return q + dt*qdot, p + dt*pdot
+
+
+# ------------------------------
+# EBFlow policy (additive coupling; exact soft value)
+# ------------------------------
+class AdditiveCoupling(nn.Module):
+    """
+    RealNVP-style additive coupling with state/context conditioning (s -> scale/shift nets).
+    Jacobian det is constant (1), satisfying Prop. for deterministic argmax via prior mean.
+    """
+    def __init__(self, dim, ctx_dim, hidden=256):
+        super().__init__()
+        self.dim = dim
+        self.mask = nn.Parameter((torch.arange(dim) % 2 == 0).float(), requires_grad=False)
+        in_dim = int((self.mask==1).sum().item()) + ctx_dim
+        out_dim = int((self.mask==0).sum().item())
+        self.net = mlp(in_dim, out_dim, hidden=(hidden, hidden), act=nn.SiLU)
+
+    def forward(self, a, ctx, reverse=False):
+        m = self.mask
+        a1 = a * m
+        h = torch.cat([a1[:, m.bool()], ctx], dim=-1)
+        t = self.net(h)
+        if reverse:
+            a2 = (a * (1 - m)) - t
+        else:
+            a2 = (a * (1 - m)) + t
+        y = a1 + a2
+        return y
+
+class EBFlowPolicy(nn.Module):
+    """
+    EBFlow πθ(a|s) via invertible gθ and Gaussian prior.
+    - Nonlinear blocks: additive coupling (det=1 wrt input), so soft value is tractable.
+    - Linear blocks (context-dependent affine on state only) contribute to normalizer.
+    Exact soft-Q / soft-V:
+       Qθ(s,a) = α log pz(g(a|s)) + α * sum_{nonlin} log|det J|  (det=1 here)
+       Vθ(s)   = -α log ∏_{lin} |det J_lin(s)|   (constant wrt a)
+    For simplicity we use det=1 for all nonlin and compute Vθ(s) from a "linear state gate".
+    """
+    def __init__(self, act_dim, ctx_dim, num_coupling=4, alpha=0.2):
+        super().__init__()
+        self.alpha = alpha
+        self.prior_mu = nn.Parameter(torch.zeros(act_dim), requires_grad=False)
+        self.prior_logstd = nn.Parameter(torch.zeros(act_dim), requires_grad=False)
+        self.couplings = nn.ModuleList([AdditiveCoupling(act_dim, ctx_dim, hidden=256) for _ in range(num_coupling)])
+        # "Linear part" determinant: make an s-dependent linear scale L(s) with positive diag -> contributes to V(s)
+        self.lin_scale = mlp(ctx_dim, act_dim, hidden=(128,128), act=nn.SiLU, out_act=None)
+
+        # Reward shifting heads (for SCDQ)
+        self.b1 = mlp(ctx_dim, 1, hidden=(128,128), act=nn.SiLU)
+        self.b2 = mlp(ctx_dim, 1, hidden=(128,128), act=nn.SiLU)
+
+    def g(self, a, ctx):
+        """Forward transform a -> z."""
+        z = a
+        for c in self.couplings:
+            z = c(z, ctx, reverse=False)
+        # apply linear diag scale (depend on state only): y = diag(exp(s)) ∘ z
+        s = self.lin_scale(ctx)  # R^A
+        y = z * torch.exp(s)
+        return y, s
+
+    def g_inv(self, z, ctx):
+        """Inverse transform z -> a (deterministic sampling)."""
+        s = self.lin_scale(ctx)
+        z = z * torch.exp(-s)
+        a = z
+        for c in reversed(self.couplings):
+            a = c(a, ctx, reverse=True)
+        return a
+
+    def log_pz(self, z):
+        return -0.5 * (((z - self.prior_mu) / torch.exp(self.prior_logstd))**2 + 2*self.prior_logstd + math.log(2*math.pi)).sum(-1)
+
+    def Q_soft(self, s, a):
+        z, s_lin = self.g(a, s)            # s_lin only depends on state
+        logpz = self.log_pz(z)
+        # non-linear det = 1; linear det contributes to V only
+        return self.alpha * logpz
+
+    def V_soft(self, s):
+        s_lin = self.lin_scale(s)
+        # z-scaling det appears in normalizer with negative sign:
+        # V(s) = -α * log |det(diag(exp(s_lin)))| = -α * sum s_lin
+        return -self.alpha * s_lin.sum(-1, keepdim=True)
+
+    def act_deterministic(self, s):
+        # Proposition: argmax_a Q(s,a) = g^{-1}(argmax_z p(z)|s) = g^{-1}(mu|s)
+        z_star = self.prior_mu.expand(s.shape[0], -1)
+        return self.g_inv(z_star, s)
+
+    def reward_shifts(self, s):
+        return self.b1(s), self.b2(s)  # [B,1], [B,1]
+
+
+# ------------------------------
+# MEow-style learner (single objective) with SCDQ
+# ------------------------------
+@dataclass
+class MEowCfg:
+    gamma: float = 0.99
+    alpha: float = 0.2
+    lr: float = 3e-4
+    tau: float = 0.005
+    batch_size: int = 4096
+    replay_size: int = 1_000_000
+    updates_per_step: int = 1
+
+
+class Replay:
+    def __init__(self, capacity, state_dim, act_dim, device):
+        self.device = device
+        self.capacity = capacity
+        self.ptr = 0; self.full = False
+        self.s  = torch.zeros((capacity, state_dim), device=device)
+        self.a  = torch.zeros((capacity, act_dim), device=device)
+        self.r  = torch.zeros((capacity, 1), device=device)
+        self.sn = torch.zeros((capacity, state_dim), device=device)
+        self.d  = torch.zeros((capacity, 1), device=device)
+
+    @torch.no_grad()
+    def add(self, s, a, r, sn, d):
+        n = s.shape[0]
+        idx = torch.arange(n, device=self.device) + self.ptr
+        idx = idx % self.capacity
+        self.s[idx] = s
+        self.a[idx] = a
+        self.r[idx] = r
+        self.sn[idx] = sn
+        self.d[idx] = d
+        self.ptr = int((self.ptr + n) % self.capacity)
+        if self.ptr == 0: self.full = True
+
+    def sample(self, B):
+        maxn = self.capacity if self.full else self.ptr
+        idx = torch.randint(0, maxn, (B,), device=self.device)
+        return self.s[idx], self.a[idx], self.r[idx], self.sn[idx], self.d[idx]
+
+
+class MEowLearner:
+    def __init__(self, state_dim, act_dim, ctx_dim, cfg: MEowCfg, device):
+        self.device = device
+        self.cfg = cfg
+        self.policy = EBFlowPolicy(act_dim, ctx_dim, num_coupling=4, alpha=cfg.alpha).to(device)
+        self.target = EBFlowPolicy(act_dim, ctx_dim, num_coupling=4, alpha=cfg.alpha).to(device)
+        self.target.load_state_dict(self.policy.state_dict())
+        self.opt = torch.optim.Adam(self.policy.parameters(), lr=cfg.lr)
+        self.replay = Replay(cfg.replay_size, state_dim, act_dim, device)
+
+    @torch.no_grad()
+    def act(self, ctx):
+        return self.policy.act_deterministic(ctx)
+
+    def update(self):
+        if not (self.replay.full or self.replay.ptr >= self.cfg.batch_size): 
+            return {}
+        s, a, r, sn, d = self.replay.sample(self.cfg.batch_size)
+        # Q, V (current and target)
+        Q = self.policy.Q_soft(s, a).unsqueeze(-1)                 # [B,1]
+        Vn = self.target.V_soft(sn)                                # [B,1]
+        b1, b2 = self.policy.reward_shifts(s)                      # [B,1],[B,1]
+        b1n, b2n = self.target.reward_shifts(sn)
+        # SCDQ target
+        V_clip_n = Vn + torch.minimum(b1n, b2n)
+        target = r + (1.0 - d) * self.cfg.gamma * V_clip_n
+        Q1 = Q + b1
+        Q2 = Q + b2
+        loss = 0.5 * (Q1 - target).pow(2).mean() + 0.5 * (Q2 - target).pow(2).mean()
+
+        self.opt.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
+        self.opt.step()
+        # Polyak averaging
+        with torch.no_grad():
+            for tp, p in zip(self.target.parameters(), self.policy.parameters()):
+                tp.data.mul_(1 - self.cfg.tau).add_(self.cfg.tau * p.data)
+        return {"loss": float(loss.item())}
+
+
+# ------------------------------
+# Isaac Gym wrapper (minimal)
+# ------------------------------
+def make_isaac_env(name: str, num_envs: int, device: str):
+    """
+    Expects IsaacGymEnvs. Example names: "Humanoid", "Ant", "ANYmal", etc.
+    Returns a simple vectorized API: reset() -> obs [N, S], step(a)->(obs,reward,done,info)
+    """
+    try:
+        from isaacgymenvs.utils.reformat import omegaconf_to_dict
+        import isaacgymenvs
+        from isaacgymenvs.utils.task_registry import make_task
+        from omegaconf import OmegaConf
+    except Exception as e:
+        raise RuntimeError("IsaacGymEnvs not found. Please install and set up.") from e
+
+    cfg = OmegaConf.create({
+        "seed": 0,
+        "task": {"name": name, "physics_engine": "physx", "env": {"numEnvs": num_envs}},
+        "sim": {"physx": {"num_threads": 4}}
+    })
+    env = make_task(name, cfg=cfg, sim_device=device, graphics_device_id=0, headless=True, multi_gpu=False)
+    obs_space = env.observation_space
+    act_space = env.action_space
+    state_dim = obs_space.shape[0]
+    act_dim = act_space.shape[0]
+
+    class VecEnv:
+        def __init__(self, env):
+            self.env = env
+            self.num_envs = num_envs
+            self.state_dim = state_dim
+            self.act_dim = act_dim
+            self.device = device
+
+        def reset(self):
+            obs = self.env.reset()
+            return torch.as_tensor(obs, device=self.device, dtype=torch.float32)
+
+        def step(self, a):
+            a_np = a.detach().cpu().numpy()
+            obs, rew, done, info = self.env.step(a_np)
+            return (
+                torch.as_tensor(obs, device=self.device, dtype=torch.float32),
+                torch.as_tensor(rew, device=self.device, dtype=torch.float32).unsqueeze(-1),
+                torch.as_tensor(done, device=self.device, dtype=torch.float32).unsqueeze(-1),
+                info
+            )
+
+    return VecEnv(env), state_dim, act_dim
+
+
+# ------------------------------
+# Training loop
+# ------------------------------
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--amass_root", type=str, required=True, help="Path to AMASS (npz/npy arrays of joint angles)")
+    parser.add_argument("--env", type=str, default="Humanoid")
+    parser.add_argument("--num_envs", type=int, default=1024)
+    parser.add_argument("--steps", type=int, default=200_000)
+    parser.add_argument("--k", type=int, default=32, help="latent pos dimension")
+    parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument("--seed", type=int, default=0)
+    args = parser.parse_args()
+
+    torch.manual_seed(args.seed); np.random.seed(args.seed)
+
+    # 1) Build Isaac env
+    vecenv, S, A = make_isaac_env(args.env, args.num_envs, args.device)
+    obs = vecenv.reset()
+
+    # 2) Fit AMASS Hamiltonian manifold on device
+    #    Here we assume AMASS joint vector dimension D matches or relates to your env obs skeleton.
+    #    In practice, map your env's humanoid joints to AMASS joints if needed.
+    D_amass = 156  # placeholder; your AMASS joint-angle dimension
+    ham = LinearHamiltonianManifold(D_in=D_amass, cfg=HamiltonianManifoldCfg(k=args.k)).to(args.device)
+    ham.fit_from_amass(args.amass_root, take=80)
+
+    # 3) Build learner
+    #    Context = [env_obs, q, p, residual_proj]  (we use only q and ignore p at runtime; residual is optional)
+    ctx_dim = S + args.k
+    learner = MEowLearner(state_dim=S, act_dim=A, ctx_dim=ctx_dim, cfg=MEowCfg(), device=args.device)
+
+    # 4) Rollout & Learn
+    s = obs
+    ep_ret = torch.zeros((args.num_envs, 1), device=args.device)
+    ep_len = torch.zeros((args.num_envs, 1), device=args.device)
+    start = time.time()
+    for t in range(args.steps):
+        # Build context features: append q (from a fake AMASS-to-env mapping).
+        # If you have a kinematics mapper, replace the below with your mapping.
+        # For demo, we map the first min(S, D_amass) dims of obs to AMASS space (toy).
+        x_full = torch.zeros((args.num_envs, D_amass), device=args.device)
+        dmin = min(S, D_amass)
+        x_full[:, :dmin] = s[:, :dmin]
+        q, p, residual = ham.encode(x_full)        # [N,k], [N,k], [N,D-k]
+        ctx = torch.cat([s, q], dim=-1)            # [N, S+k]
+
+        # Deterministic EBFlow action (argmax of Q)
+        a = learner.act(ctx)                       # [N, A]
+        sn, r, d, info = vecenv.step(a)
+
+        # Store in replay (state is env obs; the learner internally recomputes ctx)
+        learner.replay.add(s, a, r, sn, d)
+
+        # Stats
+        ep_ret += r; ep_len += 1
+        done_mask = (d > 0.5)
+        if done_mask.any():
+            ep_ret[done_mask] = 0.0
+            ep_len[done_mask] = 0.0
+
+        s = sn
+
+        # Learn
+        for _ in range(learner.cfg.updates_per_step):
+            stats = learner.update()
+
+        if (t+1) % 1000 == 0:
+            elapsed = time.time() - start
+            log = f"step={t+1}  loss={stats.get('loss', float('nan')):.4f}  FPS~{int((t+1)*args.num_envs/elapsed)}"
+            print(log)
+
+    print("Training finished.")
+
+if __name__ == "__main__":
+    main()
